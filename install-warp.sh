@@ -75,6 +75,14 @@ if [ -d "lib" ]; then
   cp -a lib/* "$ROOTFS/usr/lib/"
 fi
 
+# Ensure warp-svc.service starts on boot by baking the enablement symlink into the extension
+SVC_FILE="$ROOTFS/usr/lib/systemd/system/warp-svc.service"
+if [ -f "$SVC_FILE" ]; then
+  echo "Enabling warp-svc.service in the extension..."
+  mkdir -p "$ROOTFS/usr/lib/systemd/system/multi-user.target.wants"
+  ln -sf ../warp-svc.service "$ROOTFS/usr/lib/systemd/system/multi-user.target.wants/warp-svc.service"
+fi
+
 # Remove taskbar functionality (avoids heavy GUI dependencies like webkit2gtk)
 echo "Removing warp-taskbar components..."
 find "$ROOTFS" -name "*warp-taskbar*" -exec rm -rf {} + 2>/dev/null || true
