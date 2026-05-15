@@ -75,9 +75,16 @@ if [ -d "lib" ]; then
   cp -a lib/* "$ROOTFS/usr/lib/"
 fi
 
-# Ensure warp-svc.service starts on boot by baking the enablement symlink into the extension
+# Patch the service file to use the correct binary path in sysext
 SVC_FILE="$ROOTFS/usr/lib/systemd/system/warp-svc.service"
 if [ -f "$SVC_FILE" ]; then
+  echo "Patching warp-svc.service to use correct binary paths and dependencies..."
+  # Fix binary paths
+  sed -i 's|ExecStart=/bin/warp-svc|ExecStart=/usr/bin/warp-svc|g' "$SVC_FILE"
+  sed -i 's|ExecStart=/sbin/|ExecStart=/usr/sbin/|g' "$SVC_FILE"
+  # Ensure the service waits for systemd-sysext to load the extension
+  sed -i '/^After=/s/$/\nAfter=systemd-sysext.service/' "$SVC_FILE"
+  sed -i '/^\[Unit\]/a Wants=systemd-sysext.service' "$SVC_FILE"
   echo "Enabling warp-svc.service in the extension..."
   mkdir -p "$ROOTFS/usr/lib/systemd/system/multi-user.target.wants"
   ln -sf ../warp-svc.service "$ROOTFS/usr/lib/systemd/system/multi-user.target.wants/warp-svc.service"
@@ -178,15 +185,37 @@ install_cmd() {
   local dest_dir="/var/lib/extensions.d"
   local link_dir="/var/lib/extensions"
   local dest="$dest_dir/$OUT_RAW"
+  local resolv_src=""
   echo "Installing $src to host under $dest_dir"
   mkdir -p -m0755 "$dest_dir" "$link_dir"
   rm -f "$dest" "$link_dir/${NAME}.raw"
   cp -a "$src" "$dest"
   ln -sf ../extensions.d/"$OUT_RAW" "$link_dir/${NAME}.raw"
+
+  if [ ! -e /etc/resolv.conf ]; then
+    if [ -e /run/systemd/resolve/stub-resolv.conf ]; then
+      resolv_src="/run/systemd/resolve/stub-resolv.conf"
+    elif [ -e /run/systemd/resolve/resolv.conf ]; then
+      resolv_src="/run/systemd/resolve/resolv.conf"
+    fi
+
+    if [ -n "$resolv_src" ]; then
+      ln -s "$resolv_src" /etc/resolv.conf
+      echo "Created /etc/resolv.conf symlink -> $resolv_src"
+    else
+      echo "Skipping /etc/resolv.conf symlink: no systemd-resolved target is available." >&2
+    fi
+  else
+    echo "Skipping /etc/resolv.conf symlink: file already exists."
+  fi
+
   if command -v systemctl >/dev/null 2>&1; then
     systemctl restart systemd-sysext.service || echo "Failed to restart systemd-sysext.service; check logs." >&2
     systemctl daemon-reload || true
-    echo "Installed. Run 'systemd-sysext list' to verify, then start the service with 'systemctl start warp-svc.service'"
+    echo "Installed. Run 'systemd-sysext list' to verify."
+    echo "To start the service now, run: systemctl start warp-svc.service"
+    echo "Due to some bugs I cannot seem to fix, the service does not start on boot."
+    echo "Please start it manually when you have to use warp."
   else
     echo "systemctl not found: please restart systemd-sysext.service manually." >&2
   fi
