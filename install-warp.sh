@@ -93,6 +93,7 @@ fi
 # Remove taskbar functionality (avoids heavy GUI dependencies like webkit2gtk)
 echo "Removing warp-taskbar components..."
 find "$ROOTFS" -name "*warp-taskbar*" -exec rm -rf {} + 2>/dev/null || true
+find "$ROOTFS" -type f -name "*taskbar*.desktop" -delete 2>/dev/null || true
 
 if [ -z "$(ls -A "$ROOTFS")" ]; then
   echo "No files copied into rootfs; aborting." >&2
