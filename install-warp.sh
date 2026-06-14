@@ -2,20 +2,71 @@
 set -euo pipefail
 
 # create_and_install_warp_sysext.sh
-# Extracts a local Cloudflare Warp binary DEB, prepares a sysext rootfs,
-# builds a .raw image (erofs preferred, squashfs fallback) and installs it on
-# the host under /var/lib/extensions.d/ and /var/lib/extensions/.
-
-if [ $# -ne 1 ] || [ ! -f "$1" ]; then
-  echo "Usage: $0 /path/to/cloudflare-warp_2026.4.1350.0_amd64.deb" >&2
-  exit 1
-fi
-DEB_FILE="$(realpath "$1")"
+# Extracts a local Cloudflare Warp binary RPM, prepares a sysext rootfs,
+# and installs it as a folder-based systemd-sysext extension
+# under /var/lib/extensions/.
 
 NAME="cloudflare-warp"
-OUT_RAW="${NAME}.raw"
 
-echo "This script will: (1) extract the binary DEB, (2) create a sysext .raw, (3) install it on the host."
+uninstall_cmd() {
+  echo "Stopping and disabling services..."
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop warp-svc.service 2>/dev/null || true
+    systemctl disable warp-svc.service 2>/dev/null || true
+    systemctl stop warp-sysext-enable.service 2>/dev/null || true
+    systemctl disable warp-sysext-enable.service 2>/dev/null || true
+  fi
+
+  echo "Removing host-side helper service..."
+  rm -f /etc/systemd/system/warp-sysext-enable.service
+
+  echo "Removing system extension files..."
+  rm -rf "/var/lib/extensions/${NAME}"
+
+  if [ -e /etc/resolv.conf.backup ]; then
+    echo "Restoring backed up /etc/resolv.conf..."
+    rm -f /etc/resolv.conf
+    mv /etc/resolv.conf.backup /etc/resolv.conf
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "Restarting systemd-sysext..."
+    systemctl restart systemd-sysext.service || true
+    systemctl daemon-reload || true
+  fi
+  echo "Uninstallation of Cloudflare Warp system extension completed!"
+}
+
+if [ "${1:-}" = "--uninstall" ]; then
+  if [ "$EUID" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      echo "Requesting sudo to perform uninstallation on the host..."
+      sudo env NAME="$NAME" bash -c "$(declare -f uninstall_cmd); uninstall_cmd"
+    else
+      echo "Error: Uninstallation requires root privileges. Please run as root or with sudo." >&2
+      exit 1
+    fi
+  else
+    uninstall_cmd
+  fi
+  exit 0
+fi
+
+RPM_FILE=""
+if [ $# -eq 1 ]; then
+  if [ -f "$1" ]; then
+    RPM_FILE="$(realpath "$1")"
+  else
+    echo "Error: Specified file '$1' does not exist." >&2
+    exit 1
+  fi
+elif [ $# -eq 0 ]; then
+  echo "No local RPM file specified. Will query and download the latest version automatically..."
+else
+  echo "Usage: $0 [/path/to/cloudflare-warp.x86_64.rpm | --uninstall]" >&2
+  exit 1
+fi
+echo "This script will: (1) extract the binary RPM, (2) create a folder-based sysext, (3) install it on the host."
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -23,30 +74,66 @@ trap 'rm -rf "$TMP"' EXIT
 echo "Working in $TMP"
 cd "$TMP"
 
-echo "Using local DEB file: $DEB_FILE"
-cp "$DEB_FILE" bin.deb
-
-echo "Extracting binary DEB using ar and tar..."
-if ! command -v ar >/dev/null 2>&1; then
-  echo "Missing required tool: ar (binutils). Install it and retry." >&2
-  exit 1
-fi
-
-ar x bin.deb >/dev/null
-if [ -f data.tar.zst ]; then
-  if ! command -v zstd >/dev/null 2>&1; then
-    echo "Missing required tool: zstd. Install it and retry." >&2
-    exit 1
-  fi
-  tar --zstd -xf data.tar.zst
-elif [ -f data.tar.xz ]; then
-  tar -xf data.tar.xz
-elif [ -f data.tar.gz ]; then
-  tar -zxf data.tar.gz
+if [ -n "$RPM_FILE" ]; then
+  echo "Using local RPM file: $RPM_FILE"
+  cp "$RPM_FILE" bin.rpm
 else
-  echo "Could not find a recognized data.tar archive in the DEB package." >&2
+  echo "Fetching latest Cloudflare Warp RPM URL from repository..."
+  RPM_URL=$(python3 -c "
+import sys, urllib.request, gzip
+import xml.etree.ElementTree as ET
+repomd_url = 'https://pkg.cloudflareclient.com/rpm/repodata/repomd.xml'
+req = urllib.request.Request(repomd_url, headers={'User-Agent': 'Mozilla/5.0'})
+try:
+    with urllib.request.urlopen(req) as r:
+        root = ET.fromstring(r.read())
+except Exception as e:
+    print(f'Error fetching repomd.xml: {e}', file=sys.stderr)
+    sys.exit(1)
+ns = {'repo': 'http://linux.duke.edu/metadata/repo'}
+primary_href = None
+for data in root.findall('repo:data', ns):
+    if data.get('type') == 'primary':
+        loc = data.find('repo:location', ns)
+        if loc is not None:
+            primary_href = loc.get('href')
+            break
+if not primary_href:
+    print('Failed to find primary metadata href', file=sys.stderr); sys.exit(1)
+primary_url = f'https://pkg.cloudflareclient.com/rpm/{primary_href}'
+req2 = urllib.request.Request(primary_url, headers={'User-Agent': 'Mozilla/5.0'})
+try:
+    with urllib.request.urlopen(req2) as r:
+        root = ET.fromstring(gzip.decompress(r.read()))
+except Exception as e:
+    print(f'Error fetching primary metadata: {e}', file=sys.stderr)
+    sys.exit(1)
+ns = {'common': 'http://linux.duke.edu/metadata/common'}
+rpm_href = None
+for pkg in root.findall('common:package', ns):
+    name_el = pkg.find('common:name', ns)
+    arch_el = pkg.find('common:arch', ns)
+    if name_el is not None and name_el.text == 'cloudflare-warp' and arch_el is not None and arch_el.text == 'x86_64':
+        loc = pkg.find('common:location', ns)
+        if loc is not None:
+            rpm_href = loc.get('href')
+            break
+if not rpm_href:
+    print('Failed to find cloudflare-warp x86_64 package in metadata', file=sys.stderr); sys.exit(1)
+print(f'https://pkg.cloudflareclient.com/rpm/{rpm_href}')
+")
+  echo "Latest RPM URL: $RPM_URL"
+  echo "Downloading RPM..."
+  curl -L -o bin.rpm "$RPM_URL"
+fi
+
+echo "Extracting binary RPM using bsdtar..."
+if ! command -v bsdtar >/dev/null 2>&1; then
+  echo "Missing required tool: bsdtar. Install it and retry." >&2
   exit 1
 fi
+
+bsdtar -xf bin.rpm
 
 ROOTFS="$TMP/rootfs"
 mkdir -p "$ROOTFS"
@@ -75,8 +162,14 @@ if [ -d "lib" ]; then
   cp -a lib/* "$ROOTFS/usr/lib/"
 fi
 
-# Patch the service file to use the correct binary path in sysext
+# Copy the systemd service file from opt if present in the RPM structure
 SVC_FILE="$ROOTFS/usr/lib/systemd/system/warp-svc.service"
+mkdir -p "$ROOTFS/usr/lib/systemd/system"
+if [ -f "$ROOTFS/opt/cloudflare-warp/warp-svc.service" ]; then
+  cp "$ROOTFS/opt/cloudflare-warp/warp-svc.service" "$SVC_FILE"
+fi
+
+# Patch the service file to use the correct binary path in sysext
 if [ -f "$SVC_FILE" ]; then
   echo "Patching warp-svc.service to use correct binary paths and dependencies..."
   # Fix binary paths
@@ -107,91 +200,15 @@ ID=_any
 NAME=${NAME}
 INNER_EOF
 
-echo "Preparing image at $OUT_RAW"
-
-validate_image() {
-  local img="$1"
-  if [ ! -s "$img" ]; then
-    echo "Image $img is empty or missing." >&2
-    return 1
-  fi
-  if command -v file >/dev/null 2>&1; then
-    local ftype
-    ftype=$(file -b "$img")
-    case "$ftype" in
-      *"EROFS"*|*"Squashfs"*) return 0 ;;
-      *)
-        echo "Image $img has unexpected type: $ftype" >&2
-        return 1
-        ;;
-    esac
-  fi
-  return 0
-}
-
-create_erofs() {
-  local tmp_img="$OUT_RAW.tmp"
-  rm -f "$tmp_img"
-  echo "Creating erofs image (preferred)"
-  if mkfs.erofs -z lz4 --force-uid=0 --force-gid=0 "$tmp_img" "$ROOTFS" >/dev/null 2>&1; then
-    if validate_image "$tmp_img"; then
-      mv -f "$tmp_img" "$OUT_RAW"
-      echo "erofs image created: $OUT_RAW"
-      return 0
-    fi
-  fi
-  rm -f "$tmp_img"
-  echo "mkfs.erofs failed or produced invalid image; will try squashfs fallback" >&2
-  return 1
-}
-
-create_squashfs() {
-  local tmp_img="$OUT_RAW.tmp"
-  rm -f "$tmp_img"
-  echo "Creating squashfs image as fallback"
-  if mksquashfs "$ROOTFS" "$tmp_img" -comp gzip -noappend -all-root >/dev/null; then
-    if validate_image "$tmp_img"; then
-      mv -f "$tmp_img" "$OUT_RAW"
-      echo "squashfs image created: $OUT_RAW"
-      return 0
-    fi
-  fi
-  rm -f "$tmp_img"
-  return 1
-}
-
-if command -v mkfs.erofs >/dev/null 2>&1; then
-  create_erofs || true
-fi
-
-if [ ! -f "$OUT_RAW" ]; then
-  if command -v mksquashfs >/dev/null 2>&1; then
-    if ! create_squashfs; then
-      echo "mksquashfs failed or produced invalid image." >&2
-      exit 1
-    fi
-  else
-    echo "Neither mkfs.erofs nor mksquashfs available. Creating tar.gz fallback (not a valid sysext for systemd-sysext)." >&2
-    (cd "$ROOTFS" && tar czf "$TMP/$OUT_RAW.tar.gz" .)
-    echo "Created fallback archive: $TMP/$OUT_RAW.tar.gz" >&2
-    exit 1
-  fi
-fi
-
-echo "Image ready: $OUT_RAW"
-
 # Install to host
 install_cmd() {
   local src="$SRC_PATH"
-  local dest_dir="/var/lib/extensions.d"
-  local link_dir="/var/lib/extensions"
-  local dest="$dest_dir/$OUT_RAW"
+  local dest_dir="/var/lib/extensions/${NAME}"
   local resolv_src=""
-  echo "Installing $src to host under $dest_dir"
-  mkdir -p -m0755 "$dest_dir" "$link_dir"
-  rm -f "$dest" "$link_dir/${NAME}.raw"
-  cp -a "$src" "$dest"
-  ln -sf ../extensions.d/"$OUT_RAW" "$link_dir/${NAME}.raw"
+  echo "Installing folder-based system extension to host under $dest_dir"
+  mkdir -p -m0755 "/var/lib/extensions"
+  rm -rf "$dest_dir"
+  cp -a "$src" "$dest_dir"
 
   if [ ! -e /etc/resolv.conf ]; then
     if [ -e /run/systemd/resolve/stub-resolv.conf ]; then
@@ -210,28 +227,47 @@ install_cmd() {
     echo "Skipping /etc/resolv.conf symlink: file already exists."
   fi
 
+  # Create a host-side helper service to load and start warp-svc on boot
+  echo "Creating host-side helper service to start warp-svc on boot..."
+  cat > /etc/systemd/system/warp-sysext-enable.service <<EOF
+[Unit]
+Description=Enable and start Cloudflare Warp System Extension service
+After=systemd-sysext.service
+Requires=systemd-sysext.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl daemon-reload
+ExecStartPost=/usr/bin/systemctl restart warp-svc.service
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   if command -v systemctl >/dev/null 2>&1; then
+    echo "Registering and starting services on the host..."
     systemctl restart systemd-sysext.service || echo "Failed to restart systemd-sysext.service; check logs." >&2
     systemctl daemon-reload || true
-    echo "Installed. Run 'systemd-sysext list' to verify."
-    echo "To start the service now, run: systemctl start warp-svc.service"
-    echo "Due to some bugs I cannot seem to fix, the service does not start on boot."
-    echo "Please start it manually when you have to use warp."
+    systemctl enable warp-sysext-enable.service || true
+    systemctl start warp-sysext-enable.service || true
+    echo "Installed successfully and enabled to start on boot via warp-sysext-enable.service!"
+    echo "Run 'systemd-sysext list' to verify the extension is merged."
   else
-    echo "systemctl not found: please restart systemd-sysext.service manually." >&2
+    echo "systemctl not found: please restart systemd-sysext.service and warp-sysext-enable.service manually." >&2
   fi
 }
 
-SRC_PATH="$TMP/$OUT_RAW"
-export SRC_PATH OUT_RAW NAME
+SRC_PATH="$ROOTFS"
+export SRC_PATH NAME
 
 if [ "$EUID" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
-    echo "Requesting sudo to install the image on the host..."
-    sudo env SRC_PATH="$SRC_PATH" OUT_RAW="$OUT_RAW" NAME="$NAME" bash -c "$(declare -f install_cmd); install_cmd"
+    echo "Requesting sudo to install the folder-based extension on the host..."
+    sudo env SRC_PATH="$SRC_PATH" NAME="$NAME" bash -c "$(declare -f install_cmd); install_cmd"
   else
-    echo "Not running as root and sudo not available. To install the image, run as root:" >&2
-    echo "  cp -a $SRC_PATH /var/lib/extensions.d/ && ln -sf ../extensions.d/$OUT_RAW /var/lib/extensions/${NAME}.raw && systemctl restart systemd-sysext.service" >&2
+    echo "Not running as root and sudo not available. To install the extension, run as root:" >&2
+    echo "  cp -a $SRC_PATH /var/lib/extensions/${NAME} && systemctl restart systemd-sysext.service" >&2
     exit 1
   fi
 else
